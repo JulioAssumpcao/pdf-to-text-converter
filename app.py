@@ -6,25 +6,60 @@ import io
 import docx
 from PIL import Image
 import base64
+import cv2
+import numpy as np
 
 # Configuração da página Streamlit
 st.set_page_config(page_title="Conversor de PDF para Texto", layout="wide")
 st.title("Conversor de PDF para Texto")
+
+# Configuração avançada do Tesseract
+pytesseract.pytesseract.tesseract_cmd = r'tesseract'  # Certifique-se de que o caminho está correto
 
 # Função para extrair texto diretamente do PDF
 def extract_text_from_pdf(pdf_file):
     text = ""
     pdf_reader = PyPDF2.PdfReader(pdf_file)
     for page_num in range(len(pdf_reader.pages)):
-        text += pdf_reader.pages[page_num].extract_text() + "\n\n"
+        page_text = pdf_reader.pages[page_num].extract_text()
+        if page_text:
+            text += page_text + "\n\n"
     return text
 
-# Função para extrair texto usando OCR
+# Função para melhorar a qualidade da imagem para OCR
+def preprocess_image(image):
+    # Convertendo a imagem PIL para o formato numpy array para uso com OpenCV
+    img_np = np.array(image)
+    
+    # Convertendo para escala de cinza
+    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY) if len(img_np.shape) == 3 else img_np
+    
+    # Aplicando limiarização adaptativa para melhorar o contraste
+    thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                  cv2.THRESH_BINARY, 11, 2)
+    
+    # Aplicando filtro de desfoque para remover ruído
+    blur = cv2.GaussianBlur(thresh, (3, 3), 0)
+    
+    # Aplicando filtro de nitidez para melhorar a definição do texto
+    kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+    sharpened = cv2.filter2D(blur, -1, kernel)
+    
+    # Convertendo de volta para o formato PIL
+    processed_img = Image.fromarray(sharpened)
+    
+    return processed_img
+
+# Função para extrair texto usando OCR com melhorias
 def extract_text_with_ocr(pdf_file):
     text = ""
     try:
-        # Converter PDF em imagens
-        images = convert_from_bytes(pdf_file.read())
+        # Guardar conteúdo do arquivo em um buffer
+        pdf_content = pdf_file.read()
+        pdf_file.seek(0)  # Rebobinar o arquivo para uso posterior
+        
+        # Converter PDF em imagens com maior DPI para melhor qualidade
+        images = convert_from_bytes(pdf_content, dpi=300)
         
         total_pages = len(images)
         progress_bar = st.progress(0)
@@ -33,11 +68,13 @@ def extract_text_with_ocr(pdf_file):
         for i, image in enumerate(images):
             status_text.text(f"Processando página {i+1} de {total_pages} com OCR...")
             
-            # Melhorar a qualidade da imagem para OCR
-            img = image.convert('L')  # Converter para escala de cinza
+            # Pré-processamento da imagem para melhorar o OCR
+            processed_img = preprocess_image(image)
             
-            # Aplicar OCR na imagem
-            page_text = pytesseract.image_to_string(img, lang='por+eng')
+            # Configuração avançada do OCR para melhorar resultados
+            config = '--oem 3 --psm 6 -l por+eng'
+            page_text = pytesseract.image_to_string(processed_img, config=config)
+            
             text += page_text + "\n\n"
             
             # Atualizar a barra de progresso
@@ -63,12 +100,6 @@ def create_docx(text):
     
     return doc_io
 
-# Função para download de arquivo
-def get_download_link(file_bytes, file_name, file_type):
-    b64 = base64.b64encode(file_bytes.read()).decode()
-    href = f'<a href="data:{file_type};base64,{b64}" download="{file_name}">Clique aqui para baixar o arquivo {file_name}</a>'
-    return href
-
 # Interface principal
 st.write("Faça upload de um arquivo PDF para extrair seu texto, incluindo partes não selecionáveis.")
 
@@ -83,6 +114,14 @@ if uploaded_file is not None:
             "Escolha o método de extração:",
             ("PDF Direto", "OCR (para texto não selecionável)", "Ambos (recomendado)")
         )
+        
+        # Adicionar opção para qualidade OCR
+        if extraction_type in ["OCR (para texto não selecionável)", "Ambos (recomendado)"]:
+            ocr_quality = st.select_slider(
+                "Qualidade do OCR (maior qualidade = mais lento):",
+                options=["Baixa", "Média", "Alta"],
+                value="Média"
+            )
     
     with col2:
         st.write("Opções de saída:")
@@ -98,14 +137,27 @@ if uploaded_file is not None:
             # Extração do texto conforme o método escolhido
             if extraction_type == "PDF Direto":
                 extracted_text = extract_text_from_pdf(uploaded_file)
+                if not extracted_text.strip():
+                    st.warning("Não foi possível extrair texto diretamente. O PDF pode conter apenas imagens ou texto não selecionável.")
+                    st.info("Tentando extrair com OCR...")
+                    extracted_text = extract_text_with_ocr(uploaded_file)
             elif extraction_type == "OCR (para texto não selecionável)":
                 extracted_text = extract_text_with_ocr(uploaded_file)
             else:  # Ambos
-                extracted_text = extract_text_from_pdf(uploaded_file)
-                # Se o texto extraído for muito curto, aplicamos OCR
-                if len(extracted_text.split()) < 50:
+                direct_text = extract_text_from_pdf(uploaded_file)
+                
+                # Verificar se o texto extraído diretamente é suficiente
+                if len(direct_text.split()) < 50:
                     st.info("Texto extraído diretamente parece incompleto. Aplicando OCR...")
-                    extracted_text = extract_text_with_ocr(uploaded_file)
+                    ocr_text = extract_text_with_ocr(uploaded_file)
+                    
+                    # Combinar resultados (OCR geralmente é mais completo mas pode ter erros)
+                    if len(ocr_text.split()) > len(direct_text.split()):
+                        extracted_text = ocr_text
+                    else:
+                        extracted_text = direct_text
+                else:
+                    extracted_text = direct_text
             
             # Mostrar o texto extraído
             st.subheader("Texto Extraído:")
@@ -154,4 +206,10 @@ with st.expander("Sobre este aplicativo"):
     - OCR (Reconhecimento Ótico de Caracteres) para texto em imagens ou não selecionável
     
     O método "Ambos" tenta primeiro extrair diretamente e, se encontrar pouco texto, aplica OCR automaticamente.
+    
+    ### Melhorias no OCR:
+    - Pré-processamento avançado de imagens
+    - Limiarização adaptativa para melhorar o contraste
+    - Redução de ruído e melhoria de nitidez
+    - Configurações otimizadas do Tesseract OCR
     """)
